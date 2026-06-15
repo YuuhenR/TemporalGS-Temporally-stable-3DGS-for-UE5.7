@@ -1,0 +1,23 @@
+# Unreal Engine generated
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+*.sln
+*.VC.db
+*.opensdf
+*.sdf
+*.suo
+
+# build / temp
+build.log
+*.pdb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# sample splats are big, download separately into Content/Splats/
+Content/Splats/*.ply
+*.gsd

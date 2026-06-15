@@ -1,0 +1,146 @@
+// Copyright (c) 2026 TemporalGS contributors. MIT License.
+// Phase 3: anisotropic Gaussian splats with sorted alpha blending, drawn before TSR into SceneColor,
+// writing per-pixel motion vectors (SV_Target1) so TSR/TAA reproject them instead of ghosting.
+// Velocity convention copied from the engine (VelocityCommon.ush: Calculate3DVelocityBase):
+//   velocity = (currClip.xy/w - JitterCurr) - (prevClip.xy/w - JitterPrev)
+// The nearest splat (drawn last in the far->near order) sets the velocity (dominant-Gaussian mode).
+
+#include "/Engine/Public/Platform.ush"
+
+StructuredBuffer<float4> GSPositions;   // xyz = local position
+StructuredBuffer<float4> GSColors;      // rgb = color, a = opacity
+StructuredBuffer<float4> GSScales;      // xyz = scale (already exp'd)
+StructuredBuffer<float4> GSRotations;   // xyzw = quaternion
+StructuredBuffer<uint>   GSSortedIndices; // draw order: far -> near
+
+float4x4 LocalToWorld;
+float4x4 ViewProj;       // jittered world->clip (current frame, also used for rendering)
+float4x4 PrevViewProj;   // jittered world->clip (previous frame)
+float2   JitterCurr;     // current-frame TAA jitter (NDC), subtracted to un-jitter
+float2   JitterPrev;     // previous-frame TAA jitter (NDC)
+float2   OutputExtent;
+float    QuadPixelRadius;
+float    SigmaScale;
+float    OpacityScale;
+uint     NumGaussians;
+uint     DebugMode;
+uint     RenderMode;
+uint     WriteVelocity;
+
+float3x3 QuatToMat(float4 q)
+{
+	const float x = q.x, y = q.y, z = q.z, w = q.w;
+	return float3x3(
+		1 - 2*(y*y + z*z),  2*(x*y - w*z),      2*(x*z + w*y),
+		2*(x*y + w*z),      1 - 2*(x*x + z*z),  2*(y*z - w*x),
+		2*(x*z - w*y),      2*(y*z + w*x),      1 - 2*(x*x + y*y));
+}
+
+float2 ProjectAxisOffset(float3 worldCenter, float3 axis, float2 centerNDC)
+{
+	float4 cl = mul(float4(worldCenter + axis, 1.0), ViewProj);
+	float2 ndc = cl.xy / max(cl.w, 1e-4);
+	return (ndc - centerNDC) * 0.5 * OutputExtent;
+}
+
+struct FVSOut
+{
+	float4 Position : SV_POSITION;
+	float2 Local    : TEXCOORD0;
+	nointerpolation float4 Color : TEXCOORD1;
+	nointerpolation float2 Velocity : TEXCOORD2;    // un-jittered screen-space motion
+};
+
+FVSOut MainVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID)
+{
+	FVSOut Out = (FVSOut)0;
+
+	const uint gi = GSSortedIndices[InstanceId];
+
+	const float2 corners[4] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(1,1) };
+	const float2 c = corners[VertexId];
+
+	const float3 localPos = GSPositions[gi].xyz;
+	const float4 worldPos = mul(float4(localPos, 1.0), LocalToWorld);
+
+	const float4 clip = mul(worldPos, ViewProj);          // current (jittered) clip of the center
+	if (clip.w <= 0.0)
+	{
+		Out.Position = float4(2, 2, 2, 1);
+		return Out;
+	}
+	const float2 centerNDC = clip.xy / clip.w;
+
+	// Per-Gaussian motion vector (center), engine convention.
+	const float4 prevClip = mul(worldPos, PrevViewProj);
+	const float2 currScreen = centerNDC - JitterCurr;
+	const float2 prevScreen = (prevClip.xy / max(prevClip.w, 1e-4)) - JitterPrev;
+	Out.Velocity = currScreen - prevScreen;
+
+	float2 offsetPix;
+	if (RenderMode == 0)
+	{
+		offsetPix = c * QuadPixelRadius;
+	}
+	else
+	{
+		const float3x3 R = QuatToMat(GSRotations[gi]);
+		const float3 s = GSScales[gi].xyz;
+		const float3x3 M3 = (float3x3)LocalToWorld;
+		const float3 ax0 = mul(R[0] * s.x, M3);
+		const float3 ax1 = mul(R[1] * s.y, M3);
+		const float3 ax2 = mul(R[2] * s.z, M3);
+
+		const float2 d0 = ProjectAxisOffset(worldPos.xyz, ax0, centerNDC);
+		const float2 d1 = ProjectAxisOffset(worldPos.xyz, ax1, centerNDC);
+		const float2 d2 = ProjectAxisOffset(worldPos.xyz, ax2, centerNDC);
+
+		float A = d0.x*d0.x + d1.x*d1.x + d2.x*d2.x;
+		float B = d0.x*d0.y + d1.x*d1.y + d2.x*d2.y;
+		float C = d0.y*d0.y + d1.y*d1.y + d2.y*d2.y;
+		A += 0.25; C += 0.25;
+
+		const float mid = 0.5 * (A + C);
+		const float rad = sqrt(max(((A - C) * 0.5) * ((A - C) * 0.5) + B * B, 0.0));
+		const float l1 = mid + rad;
+		const float l2 = max(mid - rad, 0.1);
+		float2 e1 = float2(B, l1 - A);
+		e1 = (dot(e1, e1) > 1e-8) ? normalize(e1) : float2(1, 0);
+		const float2 e2 = float2(-e1.y, e1.x);
+
+		offsetPix = c.x * (e1 * sqrt(l1) * SigmaScale) + c.y * (e2 * sqrt(l2) * SigmaScale);
+	}
+
+	float4 outPos = clip;
+	outPos.xy += (offsetPix / OutputExtent) * 2.0 * clip.w;
+	Out.Position = outPos;
+	Out.Local = c;
+	Out.Color = GSColors[gi];
+	return Out;
+}
+
+void MainPS(FVSOut In, out float4 OutColor : SV_Target0, out float4 OutVelocity : SV_Target1)
+{
+	const float r2 = dot(In.Local, In.Local);
+	if (r2 > 1.0)
+	{
+		discard;
+	}
+
+	const float m2 = (RenderMode == 0) ? (4.0 * r2) : (SigmaScale * SigmaScale * r2);
+	const float alpha = saturate(In.Color.a * OpacityScale * exp(-0.5 * m2));
+	if (alpha < (1.0 / 255.0))
+	{
+		discard;
+	}
+
+	float3 col;
+	if (DebugMode == 1)      { col = float3(1.0, 0.0, 1.0); }                 // magenta = visibility test
+	else if (DebugMode == 2) { col = saturate(abs(In.Velocity) * 50.0); }    // velocity magnitude (move camera!)
+	else                     { col = saturate(In.Color.rgb); }
+	OutColor = float4(col * alpha, alpha);            // premultiplied "over"
+
+	// EncodeVelocityToTexture (linear, 16-bit RG path; no gamma / no depth).
+	const float2 encV = In.Velocity * (0.499 * 0.5) + (32767.0 / 65535.0);
+	OutVelocity = float4(encV, 0.0, 0.0);             // RT1 write masked off when WriteVelocity==0
+}

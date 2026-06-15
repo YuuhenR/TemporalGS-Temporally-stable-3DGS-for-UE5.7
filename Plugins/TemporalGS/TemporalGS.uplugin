@@ -1,0 +1,29 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "TemporalGS",
+	"Description": "Temporally-stable 3D Gaussian Splatting for Unreal Engine 5.7. Derives per-pixel motion vectors from alpha-blended splats and aligns the splat rasterizer with the engine TAA jitter, so splats integrate correctly with Temporal Super Resolution (TSR) / TAA instead of ghosting.",
+	"Category": "Rendering",
+	"CreatedBy": "TemporalGS contributors",
+	"CreatedByURL": "",
+	"DocsURL": "https://github.com/USER/TemporalGS/tree/main/docs",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/USER/TemporalGS/issues",
+	"EngineVersion": "5.7.0",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "TemporalGSRenderer",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "TemporalGSRuntime",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
